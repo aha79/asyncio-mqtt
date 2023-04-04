@@ -292,6 +292,8 @@ class Client:
         self._unfiltered_messages_callback: Callable[
             [mqtt.Client, Any, mqtt.MQTTMessage], None
         ] | None = None
+        
+        self._topic_filter_callbacks: dict[str, list[Callable[[mqtt.Client, Any, mqtt.MQTTMessage],None]]] = {}
 
         self._outgoing_calls_sem: asyncio.Semaphore | None
         if max_concurrent_outgoing_calls is not None:
@@ -504,13 +506,30 @@ class Client:
         callback, generator = self._deprecated_callback_and_generator(
             log_context=f'topic_filter="{topic_filter}"', queue_maxsize=queue_maxsize
         )
+
+        callback_list = self._topic_filter_callbacks.setdefault(topic_filter, [])
+        callback_list.append(callback)
+
+        def call_all_callbacks(c,d,m):
+            for callback in callback_list:
+                callback(c,d,m)
+
         try:
-            self._client.message_callback_add(topic_filter, callback)
+            if len(callback_list) > 1:
+                self._client.message_callback_add(topic_filter, call_all_callbacks)
+            else:
+                # spare overhead of additional function if there is only one subscriber 
+                self._client.message_callback_add(topic_filter, callback)
+
             # Back to the caller (run whatever is inside the with statement)
             yield generator
         finally:
-            # We are exiting the with statement. Remove the topic filter.
-            self._client.message_callback_remove(topic_filter)
+            # We are exitting the with statement. Remove the topic filter.
+            callback_list = self._topic_filter_callbacks[topic_filter]
+            callback_list.remove(callback)
+            if len(callback_list) == 0:
+                self._client.message_callback_remove(topic_filter)
+                self._topic_filter_callbacks.pop(topic_filter)
 
     @asynccontextmanager
     async def unfiltered_messages(
